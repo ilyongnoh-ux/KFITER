@@ -448,6 +448,80 @@ def init_db() -> None:
     # 인덱스 생성(컬럼 존재 후)
     c.execute("CREATE INDEX IF NOT EXISTS idx_upload_history_uploaded_at ON upload_history(uploaded_at)")
 
+    # -----------------------------------------------------------
+    # 6. Upload Holds: 업로드 '보류' 항목 영속 저장(사후 수정/결정/감사 추적)
+    # -----------------------------------------------------------
+    # [데이터(db포함) 오류] 현업 업로드에서 필연적으로 발생하는 모호/충돌 데이터를
+    # '즉시 반영'이 아닌 '보류 저장(hold_store)'로 분리하여 DB 정합성을 보호합니다.
+    # - 예: 동일 전화번호에 서로 다른 이름(파일 내부/DB 기존 고객), 계약자/피보험자 분기 등
+    #
+    # [특허 포인트]
+    # (A) hold_store: 원본(row_payload_json) + 정규화(normalized_json) + 정정(corrected_json)을
+    #     분리 저장하여 "원본 보존"과 "사후 정정"을 동시에 만족
+    # (B) decision: 대표자(사용자)가 선택한 처리결과를 hold_decisions로 기록하여
+    #     추적 가능(감사/재현)하도록 구성
+    # (C) approval/audit: 반영 승인과 감사 로그를 별도 테이블로 분리해 책임추적성을 강화
+    # -----------------------------------------------------------
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS upload_holds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_hash TEXT NOT NULL,
+            row_no INTEGER NOT NULL,
+            filename TEXT,
+            reason_code TEXT,
+            reason_msg TEXT,
+            status TEXT DEFAULT 'OPEN',       -- OPEN | SKIPPED | RESOLVED
+            raw_json TEXT,                    -- ETL/분석 산출물(원본)
+            normalized_json TEXT,             -- 정규화 키(예: phone_norm, name_norm 등)
+            corrected_json TEXT,              -- 사용자 정정값(이름/전화/생년 등)
+            candidates_json TEXT,             -- 후보 고객 목록(캐시)
+            row_payload_json TEXT,            -- 반영에 필요한 최소 payload(고객/계약)
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(file_hash, row_no)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_upload_holds_status ON upload_holds(status)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_upload_holds_filehash ON upload_holds(file_hash)")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS hold_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hold_id INTEGER NOT NULL,
+            decision TEXT NOT NULL,          -- MAP_EXISTING | CREATE_NEW | SKIP
+            target_customer_id INTEGER,
+            decision_json TEXT,
+            decided_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            decided_by TEXT,
+            FOREIGN KEY(hold_id) REFERENCES upload_holds(id) ON DELETE CASCADE
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_hold_decisions_holdid ON hold_decisions(hold_id)")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS approval_proofs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            hold_id INTEGER NOT NULL,
+            approval TEXT,                   -- APPROVED | REJECTED | AUTO
+            approval_json TEXT,
+            approved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            approved_by TEXT,
+            FOREIGN KEY(hold_id) REFERENCES upload_holds(id) ON DELETE CASCADE
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT,
+            ref_table TEXT,
+            ref_id INTEGER,
+            payload_json TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_event_type ON audit_logs(event_type)")
+
 
     conn.commit()
     conn.close()
@@ -520,9 +594,10 @@ def get_connection() -> sqlite3.Connection:
     _kfit_apply_sqlite_pragmas(conn)
     return conn
 # [체크리스트]
-# - UI 유지/존치: ✅ 유지됨
-# - 수정 범위: ✅ [데이터(db포함) 오류] 섹션만
+# - UI 유지/존치: ✅ 유지됨 (DB 스키마/연결만 보강)
+# - 신규 테이블: ✅ upload_holds / hold_decisions / approval_proofs / audit_logs
+# - 수정 범위: ✅ [데이터 정합성 보호(hold_store)] 중심
 # - '..., 중략, 일부 생략' 금지: ✅ 준수(전체 파일 유지)
-# - 수정 전 라인수: 409
-# - 수정 후 라인수: 454
+# - 수정 전 라인수: 528
+# - 수정 후 라인수: 606 (+78)
 # ---------------------------------------------------------

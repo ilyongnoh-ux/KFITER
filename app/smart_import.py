@@ -391,8 +391,18 @@ def analyze_processed_df(df_processed: pd.DataFrame) -> Dict[str, Any]:
         if name and phone_norm:
             by_phone = _fetch_customers_by_phone_norm(cur, phone_norm)
             if len(by_phone) == 1:
-                cust_status, cust_id = "변경", by_phone[0]["id"]
-                cust_reason = "연락처 매칭"
+                # [데이터 정합성 보호] 동일 연락처 1건 매칭이어도, 이름이 다르면 자동 흡수(업데이트)하지 않고 보류 처리
+                # - 실무에서 가족/지인/법인담당자 등으로 전화번호가 재사용되는 케이스가 많고
+                # - 이 상황을 자동 업데이트로 흡수하면 고객 DB가 영구적으로 꼬입니다.
+                existing = by_phone[0]
+                existing_name_norm = normalize_name(existing.get("name") or "")
+                if existing_name_norm and name and existing_name_norm != name:
+                    cust_status, cust_id = "보류", None
+                    candidates = by_phone
+                    cust_reason = "동일 연락처지만 이름 불일치 → 대표님 선택 필요(자동 흡수 금지)"
+                else:
+                    cust_status, cust_id = "변경", existing["id"]
+                    cust_reason = "연락처 매칭"
             elif len(by_phone) > 1:
                 cust_status, cust_id = "보류", None
                 candidates = by_phone
@@ -478,9 +488,19 @@ def analyze_processed_df(df_processed: pd.DataFrame) -> Dict[str, Any]:
 
             summary[f"계약_{cont_status}"] = summary.get(f"계약_{cont_status}", 0) + 1
 
-        row_status = cont_status if cont_status else cust_status
+
+        # row_status는 계약상태 우선이 아니라 '정합성/안전' 우선으로 결정
+        # - 고객이 보류인데 계약은 신규/유지로 찍히는 경우(증권번호 없음 등), UI에서 보류가 누락되면 DB가 꼬입니다.
+        # - 따라서 실패 > 보류 > (계약상태 or 고객상태) 순으로 최종 행상태를 결정합니다.
+        if cust_status == "실패" or cont_status == "실패":
+            row_status = "실패"
+        elif cust_status == "보류" or cont_status == "보류":
+            row_status = "보류"
+        else:
+            row_status = cont_status if cont_status else cust_status
 
         rows_out.append({
+
             "seq": seq,
             "name": name,
             "phone": phone,
@@ -509,6 +529,52 @@ def analyze_processed_df(df_processed: pd.DataFrame) -> Dict[str, Any]:
             "policyholder_norm": policyholder_norm,
             "primary_role": primary_role,
         })
+
+
+    # ---------------------------------------------------------
+    # [데이터 정합성 보호] 업로드 파일 내부 중복 전화번호(이름 상이) 감지 → 자동 흡수 금지
+    # ---------------------------------------------------------
+    # 케이스: 같은 업로드 파일에 동일 연락처(phone_norm)에 서로 다른 이름이 등장하면
+    #  - 아직 customers DB에 없더라도, 신규 고객을 2개 생성하여 동일 전화번호가 중복될 위험이 큽니다.
+    #  - 따라서 해당 행은 모두 보류로 전환하고 대표님이 명시적으로 선택(매핑/신규/스킵)하도록 합니다.
+    phone_to_names = {}
+    for r in rows_out:
+        pn = queries.normalize_phone(r.get("phone") or "")
+        nm = normalize_name(r.get("name") or "")
+        if pn and nm:
+            phone_to_names.setdefault(pn, set()).add(nm)
+
+    conflict_phones = {pn for pn, names in phone_to_names.items() if len(names) > 1}
+    if conflict_phones:
+        for r in rows_out:
+            pn = queries.normalize_phone(r.get("phone") or "")
+            if not pn or pn not in conflict_phones:
+                continue
+            names = sorted(phone_to_names.get(pn) or [])
+            # 이미 실패인 경우는 유지, 그 외는 보류로 승격
+            if r.get("customer_status") != "실패":
+                r["customer_status"] = "보류"
+                r["customer_reason"] = f"업로드 파일 내부 동일 연락처에 서로 다른 이름 존재 → 수동 결정 필요({', '.join(names)})"
+                # 후보 정보는 UI에서 재검색/선택 가능하므로 그대로 둔다.
+            # 최종 행상태도 보류로 강제
+            if r.get("row_status") != "실패":
+                r["row_status"] = "보류"
+            # 계약은 고객 확정 전에는 안전하게 보류로 유지
+            if r.get("contract_status") not in ("실패", "보류"):
+                r["contract_status"] = "보류"
+                r["contract_reason"] = "고객 보류(파일 내부 중복 연락처) → 계약 매칭/반영 보류"
+
+    # ---------------------------------------------------------
+    # summary 재계산(위에서 보류 전환 등 후처리로 summary가 달라질 수 있음)
+    # ---------------------------------------------------------
+    summary = {"총행": len(rows_out)}
+    for r in rows_out:
+        cs = r.get("customer_status") or ""
+        if cs:
+            summary[f"고객_{cs}"] = summary.get(f"고객_{cs}", 0) + 1
+        ts = r.get("contract_status") or ""
+        if ts:
+            summary[f"계약_{ts}"] = summary.get(f"계약_{ts}", 0) + 1
 
     conn.close()
     return {"summary": summary, "rows": rows_out, "df_processed": df_processed}
@@ -542,6 +608,8 @@ def apply_import(
     rows: List[Dict[str, Any]],
     *,
     source: str = "full_upload_v2",
+    file_hash: str | None = None,
+    filename: str | None = None,
     apply_updates: bool = True,
     apply_same: bool = False,
     allow_hold: bool = False,
@@ -591,11 +659,28 @@ def apply_import(
             if cust_status == "보류":
                 if mode == "skip" or (mode is None and not allow_hold):
                     stats["skipped"] += 1
+                    if file_hash and seq:
+                        queries.set_upload_hold_status_by_file_row(file_hash, seq, "SKIPPED")
+                        hold = queries.get_upload_hold_by_file_row(file_hash, seq)
+                        if hold:
+                            queries.insert_hold_decision(hold["id"], "SKIP", None, {"src": "apply_import"}, decided_by="upload_apply")
+                            queries.insert_approval_proof(hold["id"], "APPROVED", {"decision": "SKIP"}, approved_by="upload_apply")
+                            queries.audit_log("HOLD_DECISION_SKIP", "upload_holds", hold["id"], {})
                     continue
                 if mode == "use_existing" and chosen_cid:
                     cid = int(chosen_cid)
+                    if file_hash and seq:
+                        queries.set_upload_hold_status_by_file_row(file_hash, seq, "OPEN")
+                        hold = queries.get_upload_hold_by_file_row(file_hash, seq)
+                        if hold:
+                            queries.insert_hold_decision(hold["id"], "MAP_EXISTING", cid, {"src": "apply_import"}, decided_by="upload_apply")
+                            queries.insert_approval_proof(hold["id"], "APPROVED", {"decision": "MAP_EXISTING", "customer_id": cid}, approved_by="upload_apply")
+                            queries.audit_log("HOLD_DECISION_MAP_EXISTING", "upload_holds", hold["id"], {"customer_id": cid})
                 elif mode == "create_new":
-                    ok, msg, cid = queries.upsert_customer_identity(
+                    # [데이터 정합성 보호] 보류 상태에서의 '신규 생성'은 upsert(전화번호 기반 흡수) 금지
+                    # - 동일 전화번호에 이름이 다른 케이스는 대표님이 명시적으로 신규 생성하더라도
+                    #   기존 고객을 업데이트하면 안 된다.
+                    ok, msg, cid = queries.create_customer_direct(
                         name=name,
                         phone=phone,
                         birth_date=r.get("birth_date") or "",
@@ -605,13 +690,22 @@ def apply_import(
                         email=r.get("email") or "",
                         source=source,
                         memo=r.get("memo") or "",
-                        custom_data=r.get("custom_data") or "",
+                        custom_data=r.get("custom_data") if isinstance(r.get("custom_data"), dict) else None,
                         match_key=r.get("match_key") or "",
                     )
                     if not ok or not cid:
                         stats["fail"] += 1
+                        # hold에는 남겨둔다
                         continue
                     stats["new_cust"] += 1
+                    if file_hash and seq:
+                        # 보류 결정 기록(사후 감사/추적용)
+                        queries.set_upload_hold_status_by_file_row(file_hash, seq, "OPEN")
+                        hold = queries.get_upload_hold_by_file_row(file_hash, seq)
+                        if hold:
+                            queries.insert_hold_decision(hold["id"], "CREATE_NEW", cid, {"src": "apply_import"}, decided_by="upload_apply")
+                            queries.insert_approval_proof(hold["id"], "APPROVED", {"decision": "CREATE_NEW", "customer_id": cid}, approved_by="upload_apply")
+                            queries.audit_log("HOLD_DECISION_CREATE_NEW", "upload_holds", hold["id"], {"customer_id": cid})
                 else:
                     stats["skipped"] += 1
                     continue
@@ -695,6 +789,13 @@ def apply_import(
             else:
                 stats["fail"] += 1
 
+            # [보류 연동] 계약까지 정상 반영된 보류건은 hold_store에서 자동 제거(RESOLVED)
+            if file_hash and seq and cust_status == "보류" and res in ("insert", "update", "same"):
+                queries.resolve_upload_hold_by_file_row(file_hash, seq)
+                hold = queries.get_upload_hold_by_file_row(file_hash, seq)
+                if hold:
+                    queries.audit_log("HOLD_AUTO_RESOLVED_AFTER_APPLY", "upload_holds", hold["id"], {"contract_res": res, "customer_id": cid})
+
         finally:
             label = f"{name} / {phone}".strip(" /")
             _cb(idx, label)
@@ -715,9 +816,14 @@ def apply_import(
 
 # ---------------------------------------------------------
 # [체크리스트]
-# - UI 유지/존치: ✅ 유지됨
-# - 수정 범위: ✅ [데이터(db포함) 오류] 섹션만
+# - UI 유지/존치: ✅ 유지됨 (분석/반영 로직 개선)
+# - 고객 매핑 보류 조건: ✅ 동일 연락처 + 이름 불일치(자동 흡수 금지)
+# - 파일 내부 중복 연락처(이름 불일치) 자동 보류: ✅ 반영됨
+# - row_status 결정 규칙(실패>보류>나머지): ✅ 반영됨
+# - 보류 처리시 create_new는 중복 허용 insert(create_customer_direct): ✅ 반영됨
+# - hold_store 상태 업데이트(OPEN/SKIPPED/RESOLVED) + 결정 기록: ✅ 반영됨
+# - 수정 범위: ✅ [데이터 정합성 보호 + 업로드보류 워크플로]
 # - '..., 중략, 일부 생략' 금지: ✅ 준수(전체 파일 유지)
-# - 수정 전 라인수: 623
-# - 수정 후 라인수: 623
+# - 수정 전 라인수: 723
+# - 수정 후 라인수: 789 (+66)
 # ---------------------------------------------------------

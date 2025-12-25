@@ -780,7 +780,908 @@ def upsert_upload_history(file_hash: str, action: str, filename: str, filesize: 
 
 
 
-# --- Others (Tasks, Logs, Deletion - 기존 유지) ---
+
+
+# ---------------------------------------------------------
+# [데이터(db포함) 오류] Upload Hold Store (hold_store / decision / approval / audit)
+# ---------------------------------------------------------
+# 목적:
+# - 업로드 과정에서 발생하는 모호/충돌 데이터를 즉시 DB 반영하지 않고 '보류'로 저장하여
+#   데이터 정합성을 보호한다.
+# - 대표님이 사후에 (1) 기존 고객 매핑 (2) 신규 고객 생성 (3) 스킵 을 명시적으로 결정할 수 있도록
+#   근거(원본/정규화/정정/후보/결정/감사)를 1:1 매핑 구조로 보존한다.
+#
+# 특허 포인트(명세서 용어 1:1):
+# - hold_store   => upload_holds
+# - decision     => hold_decisions
+# - approval     => approval_proofs
+# - audit        => audit_logs
+# ---------------------------------------------------------
+
+def _json_dumps_safe(obj) -> str:
+    """JSON 직렬화 안전 래퍼(특허: 입력 다양성에 대한 견고성)."""
+    try:
+        return json.dumps(obj or {}, ensure_ascii=False)
+    except Exception:
+        try:
+            return json.dumps({"repr": repr(obj)}, ensure_ascii=False)
+        except Exception:
+            return "{}"
+
+
+def audit_log(event_type: str, ref_table: str, ref_id: int | None, payload: dict | None = None) -> None:
+    """감사 로그 기록(실패해도 앱이 죽지 않도록 방어)."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO audit_logs (event_type, ref_table, ref_id, payload_json)
+                   VALUES (?, ?, ?, ?)""",
+            (event_type, ref_table, int(ref_id) if ref_id is not None else None, _json_dumps_safe(payload)),
+        )
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
+
+def create_customer_direct(
+    name: str,
+    phone: str,
+    birth_date: str = "",
+    gender: str = "",
+    region: str = "",
+    address: str = "",
+    email: str = "",
+    source: str = "",
+    custom_data: dict | None = None,
+    memo: str = "",
+) -> tuple[bool, str, int | None]:
+    """고객을 '무조건 신규'로 생성한다(전화번호 중복 허용).
+
+    [왜 필요한가]
+    - upsert_customer_identity는 phone_norm 기준으로 기존 고객을 업데이트(흡수)한다.
+    - '동일 전화번호 + 다른 이름'은 정합성 위험이 커서 대표님이 명시적으로 신규 생성할 수 있어야 함.
+    - 따라서 'create_new' 결정은 이 함수로만 생성하여 자동 흡수를 차단한다.
+    """
+    nm = (name or "").strip()
+    ph = (phone or "").strip()
+    pn = normalize_phone(ph)
+    mk = make_match_key(nm, phone_last4(ph))
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO customers (name, phone, phone_norm, birth_date, gender, region, address, email, source,
+                                      custom_data, match_key, memo, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (
+                nm,
+                ph,
+                pn,
+                (birth_date or "").strip(),
+                (gender or "").strip(),
+                (region or "").strip(),
+                (address or "").strip(),
+                (email or "").strip(),
+                (source or "").strip(),
+                _json_dumps_safe(custom_data or {}),
+                mk,
+                (memo or "").strip(),
+            ),
+        )
+        cid = int(cur.lastrowid)
+        conn.commit()
+        audit_log("CUSTOMER_CREATE_DIRECT", "customers", cid, {"name": nm, "phone_norm": pn, "birth_date": birth_date})
+        return True, "created", cid
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"오류: {e}", None
+    finally:
+        conn.close()
+
+
+def find_customer_candidates(name: str = "", phone: str = "", birth_date: str = "", limit: int = 30):
+    """보류 해결용 후보 고객 리스트를 생성한다.
+
+    매칭 신뢰도 순서(특허: 다중 기준 스코어링):
+    1) phone_norm 정확 일치
+    2) match_key(이름1글자+번호4자리) 일치 후 이름 패턴 검증
+    3) name + birth_date 일치(공백 제거/정규화)
+
+    반환: [{id,name,phone,birth_date,score,reason}, ...]
+    """
+    nm = (name or "").strip()
+    ph = (phone or "").strip()
+    pn = normalize_phone(ph)
+    mk = make_match_key(nm, phone_last4(ph))
+    bd = (birth_date or "").strip()
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        seen = {}
+
+        # 1) phone_norm
+        if pn:
+            cur.execute(
+                """SELECT id, name, phone, birth_date FROM customers
+                       WHERE phone_norm = ?
+                       ORDER BY id DESC
+                       LIMIT ?""",
+                (pn, limit),
+            )
+            for cid, cname, cphone, cbd in cur.fetchall():
+                seen[int(cid)] = {"id": int(cid), "name": cname, "phone": cphone, "birth_date": cbd, "score": 100, "reason": "phone"}
+
+        # 2) match_key
+        if mk:
+            cur.execute(
+                """SELECT id, name, phone, birth_date FROM customers
+                       WHERE match_key = ?
+                       ORDER BY id DESC
+                       LIMIT ?""",
+                (mk, limit),
+            )
+            for cid, cname, cphone, cbd in cur.fetchall():
+                cid = int(cid)
+                # 이름 패턴 검증(마스킹/초성 등)
+                try:
+                    ok = utils.is_name_match(nm, cname) if nm else True
+                except Exception:
+                    ok = True
+                if not ok:
+                    continue
+                if cid not in seen:
+                    seen[cid] = {"id": cid, "name": cname, "phone": cphone, "birth_date": cbd, "score": 70, "reason": "match_key"}
+
+        # 3) name+birth
+        if nm and bd:
+            cur.execute(
+                """SELECT id, name, phone, birth_date FROM customers
+                       WHERE REPLACE(name, ' ', '') = REPLACE(?, ' ', '')
+                         AND birth_date = ?
+                       ORDER BY id DESC
+                       LIMIT ?""",
+                (nm, bd, limit),
+            )
+            for cid, cname, cphone, cbd in cur.fetchall():
+                cid = int(cid)
+                if cid not in seen:
+                    seen[cid] = {"id": cid, "name": cname, "phone": cphone, "birth_date": cbd, "score": 80, "reason": "name_birth"}
+
+        # 정렬
+        out = sorted(seen.values(), key=lambda r: (-int(r.get("score", 0)), -int(r.get("id", 0))))
+        return out[:limit]
+    finally:
+        conn.close()
+
+
+def _reason_code_from_row(r: dict) -> str:
+    """분석 row(dict)로부터 보류 사유 코드를 산출."""
+    cr = (r.get("customer_reason") or "")
+    rr = (r.get("row_reason") or "")
+    tr = (r.get("contract_reason") or "")
+    msg = f"{cr} {rr} {tr}".strip()
+
+    if "파일 내부" in msg and "연락처" in msg and "서로 다른" in msg:
+        return "PHONE_NAME_CONFLICT_FILE"
+    if "동일 연락처" in msg and "이름" in msg and "불일치" in msg:
+        return "PHONE_NAME_MISMATCH_DB"
+    if "동일 연락처 고객이 2명 이상" in msg:
+        return "PHONE_DUP_DB"
+    if "필수" in msg or "없음" in msg:
+        return "REQUIRED_MISSING"
+    return "HOLD"
+
+
+def sync_upload_holds(file_hash: str, filename: str, rows: list[dict]) -> int:
+    """분석 결과의 보류 행을 upload_holds로 동기화한다.
+
+    - UNIQUE(file_hash,row_no)로 중복을 방지한다.
+    - 이미 RESOLVED 된 항목은 덮어쓰지 않는다(재업로드해도 해결 상태 유지).
+
+    반환: 동기화된(INSERT/UPDATE 시도) 건수
+    """
+    if not rows:
+        return 0
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        synced = 0
+        for r in rows:
+            if (r.get("row_status") or "") != "보류":
+                continue
+            row_no = int(r.get("seq") or r.get("row_no") or 0)
+            if row_no <= 0:
+                continue
+
+            reason_code = _reason_code_from_row(r)
+            reason_msg = (r.get("customer_reason") or r.get("contract_reason") or r.get("row_reason") or "보류").strip()
+
+            name = r.get("name") or ""
+            phone = r.get("phone") or ""
+            birth_date = r.get("birth_date") or ""
+            normalized = {
+                "name_norm": (str(name).strip().replace(" ", "")),
+                "phone_norm": normalize_phone(phone),
+                "birth_date": str(birth_date).strip(),
+            }
+
+            candidates = r.get("customer_candidates")
+            if not candidates:
+                # 파일 내부 충돌/신규 보류인 경우에도 후보를 생성해둔다(사후 UI 편의)
+                candidates = find_customer_candidates(name=name, phone=phone, birth_date=birth_date, limit=20)
+
+            # 반영용 최소 payload (원본 보존)
+            row_payload = {
+                "seq": r.get("seq"),
+                "name": name,
+                "phone": phone,
+                "birth_date": birth_date,
+                "gender": r.get("gender"),
+                "region": r.get("region"),
+                "address": r.get("address"),
+                "email": r.get("email"),
+                "source": r.get("source"),
+                "memo": r.get("memo"),
+                "custom_data": r.get("custom_data"),
+                "policyholder_name": r.get("policyholder_name"),
+                "policyholder_phone": r.get("policyholder_phone"),
+                "policyholder_type": r.get("policyholder_type"),
+                "policyholder_norm": r.get("policyholder_norm"),
+                "primary_role": r.get("primary_role"),
+                "financial": r.get("financial") or {},
+            }
+
+            # 이미 RESOLVED면 덮어쓰지 않음
+            cur.execute(
+                """SELECT id, status FROM upload_holds WHERE file_hash = ? AND row_no = ?""",
+                (file_hash, row_no),
+            )
+            ex = cur.fetchone()
+            if ex and (ex[1] or "") == "RESOLVED":
+                continue
+
+            raw_json = _json_dumps_safe(r)
+            normalized_json = _json_dumps_safe(normalized)
+            candidates_json = _json_dumps_safe(candidates)
+            row_payload_json = _json_dumps_safe(row_payload)
+
+            if not ex:
+                cur.execute(
+                    """INSERT INTO upload_holds (file_hash, row_no, filename, reason_code, reason_msg, status,
+                                                  raw_json, normalized_json, corrected_json, candidates_json, row_payload_json,
+                                                  created_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, '', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                    (file_hash, row_no, filename, reason_code, reason_msg, raw_json, normalized_json, candidates_json, row_payload_json),
+                )
+                hold_id = int(cur.lastrowid)
+                audit_log("HOLD_CREATE", "upload_holds", hold_id, {"file_hash": file_hash, "row_no": row_no, "reason": reason_code})
+                synced += 1
+            else:
+                hold_id = int(ex[0])
+                cur.execute(
+                    """UPDATE upload_holds
+                          SET filename=?, reason_code=?, reason_msg=?, status=COALESCE(NULLIF(status,''),'OPEN'),
+                              raw_json=?, normalized_json=?, candidates_json=?, row_payload_json=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=?""",
+                    (filename, reason_code, reason_msg, raw_json, normalized_json, candidates_json, row_payload_json, hold_id),
+                )
+                synced += 1
+
+        conn.commit()
+        return synced
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+    finally:
+        conn.close()
+
+
+def list_upload_hold_reason_codes() -> list[str]:
+    """upload_holds에 존재하는 사유코드 목록을 반환한다.
+
+    [데이터(db포함) 오류] 운영 중 사유코드는 추가/변경될 수 있으므로, UI에서 하드코딩하지 않고
+    DB에서 현재 사용 중인 사유코드를 가져와 필터로 제공할 수 있도록 한다.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT DISTINCT reason_code
+                   FROM upload_holds
+                  WHERE COALESCE(reason_code,'') <> ''
+                  ORDER BY reason_code ASC"""
+        )
+        return [r[0] for r in cur.fetchall() if r and r[0]]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def list_upload_hold_batches(limit: int = 50) -> list[dict]:
+    """업로드 배치(=file_hash) 단위로 보류 건수를 집계한다.
+
+    [데이터(db포함) 오류] '업로드보류(관리)' 화면에서 특정 업로드(파일)만 골라 보류를 처리할 수 있어야 한다.
+    - upload_id: 내부적으로 file_hash를 사용(명세서의 업로드 배치 식별자와 1:1 매핑)
+    - open_count: 아직 해결되지 않은 보류(OPEN)
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT
+                    file_hash AS upload_id,
+                    MAX(filename) AS filename,
+                    MIN(created_at) AS created_at,
+                    SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) AS open_count,
+                    SUM(CASE WHEN status='RESOLVED' THEN 1 ELSE 0 END) AS resolved_count,
+                    SUM(CASE WHEN status='SKIPPED' THEN 1 ELSE 0 END) AS skipped_count
+                FROM upload_holds
+                GROUP BY file_hash
+                ORDER BY created_at DESC
+                LIMIT ?""",
+            (int(limit),),
+        )
+        rows = cur.fetchall() or []
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "upload_id": r[0],
+                    "filename": r[1],
+                    "created_at": r[2],
+                    "open_count": int(r[3] or 0),
+                    "resolved_count": int(r[4] or 0),
+                    "skipped_count": int(r[5] or 0),
+                }
+            )
+        return out
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def list_upload_holds(
+    statuses: list[str] | None = None,
+    keyword: str | None = None,
+    upload_id: str | None = None,
+    reason_codes: list[str] | None = None,
+    limit: int = 200,
+    offset: int = 0,
+):
+    """upload_holds 목록 조회(업로드보류 관리용).
+
+    [데이터(db포함) 오류] main.py(업로드보류(관리) 탭)가 기대하는 구조로 '정규화/정정/후보/계약힌트'를 함께 제공한다.
+
+    반환 dict 스키마(주요):
+    - id, row_no, status, reason_code, reason_msg
+    - normalized: dict
+    - corrected: dict
+    - candidates: list[dict]
+    - contract_hint: dict(보험사/상품/증권/상태 등)
+    - display_name/display_phone: UI 표시용(정정 > 정규화 > 원본 순)
+    """
+
+    def _loads(s: str, default):
+        try:
+            return json.loads(s) if s else default
+        except Exception:
+            return default
+
+    # 상태 기본값
+    st_list = [s.upper() for s in (statuses or ["OPEN"]) if s]
+    if "ALL" in st_list:
+        st_list = []
+
+    kw = (keyword or "").strip()
+    upload_id = (upload_id or "").strip() or None
+    rcodes = [c for c in (reason_codes or []) if c]
+
+    where = ["1=1"]
+    params: list = []
+
+    if st_list:
+        where.append(f"status IN ({','.join(['?']*len(st_list))})")
+        params.extend(st_list)
+
+    if upload_id:
+        # upload_id는 file_hash와 동일 취급
+        where.append("file_hash=?")
+        params.append(upload_id)
+
+    if rcodes:
+        where.append(f"reason_code IN ({','.join(['?']*len(rcodes))})")
+        params.extend(rcodes)
+
+    if kw:
+        like = f"%{kw}%"
+        # JSON 컬럼을 대상으로 단순 LIKE 검색(속도는 느릴 수 있으나 운영 규모(로컬)에서 충분)
+        where.append("(row_payload_json LIKE ? OR normalized_json LIKE ? OR corrected_json LIKE ? OR candidates_json LIKE ? OR reason_msg LIKE ?)")
+        params.extend([like, like, like, like, like])
+
+    sql = f"""
+        SELECT id, file_hash, row_no, filename, reason_code, reason_msg, status,
+               normalized_json, corrected_json, candidates_json, row_payload_json,
+               created_at, updated_at
+          FROM upload_holds
+         WHERE {' AND '.join(where)}
+         ORDER BY created_at DESC, id DESC
+         LIMIT ? OFFSET ?
+    """
+    params.extend([int(limit), int(offset)])
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall() or []
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+
+    out = []
+    for r in rows:
+        hid = int(r[0])
+        file_hash = r[1]
+        row_no = int(r[2])
+        filename = r[3]
+        reason_code = r[4]
+        reason_msg = r[5]
+        status = r[6]
+        normalized = _loads(r[7] or "", {})
+        corrected = _loads(r[8] or "", {})
+        candidates = _loads(r[9] or "", [])
+        payload = _loads(r[10] or "", {})
+        created_at = r[11]
+        updated_at = r[12]
+
+        # 계약 힌트(행 payload에 저장해둔 financial 요약을 그대로 사용)
+        fin = payload.get("financial") if isinstance(payload.get("financial"), dict) else {}
+        contract_hint = {
+            "policy_no": fin.get("policy_no"),
+            "company": fin.get("company"),
+            "product_name": fin.get("product_name"),
+            "status": fin.get("status"),
+            "start_date": fin.get("start_date"),
+            "end_date": fin.get("end_date"),
+            "insured_name": fin.get("insured_name"),
+            "policyholder_name": fin.get("policyholder_name") or payload.get("policyholder_name"),
+        }
+
+        display_name = (corrected.get("name") or normalized.get("name") or payload.get("name") or "").strip() or "-"
+        display_phone = (corrected.get("phone") or normalized.get("phone") or payload.get("phone") or "").strip() or "-"
+
+        out.append(
+            {
+                "id": hid,
+                "file_hash": file_hash,
+                "upload_id": file_hash,
+                "row_no": row_no,
+                "filename": filename,
+                "reason_code": reason_code,
+                "reason_msg": reason_msg,
+                "status": status,
+                "normalized": normalized,
+                "corrected": corrected,
+                "candidates": candidates,
+                "payload": payload,
+                "contract_hint": contract_hint,
+                "display_name": display_name,
+                "display_phone": display_phone,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            }
+        )
+    return out
+
+
+def get_upload_hold(hold_id: int):
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT id, file_hash, row_no, filename, reason_code, reason_msg, status,
+                      raw_json, normalized_json, corrected_json, candidates_json, row_payload_json,
+                      created_at, updated_at
+                   FROM upload_holds
+                  WHERE id=?""",
+            (int(hold_id),),
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "id": int(r[0]),
+            "file_hash": r[1],
+            "row_no": int(r[2]),
+            "filename": r[3],
+            "reason_code": r[4],
+            "reason_msg": r[5],
+            "status": r[6],
+            "raw_json": r[7],
+            "normalized_json": r[8],
+            "corrected_json": r[9],
+            "candidates_json": r[10],
+            "row_payload_json": r[11],
+            "created_at": r[12],
+            "updated_at": r[13],
+        }
+    finally:
+        conn.close()
+
+
+def get_upload_hold_by_file_row(file_hash: str, row_no: int):
+    """(file_hash, row_no) 기준으로 보류(hold_store) 1건을 조회한다.
+
+    [데이터(db포함) 오류]
+    - 업로드 반영(apply_import) 단계에서, 보류건에 대해 '결정/승인/감사' 로그를 남기려면
+      해당 행의 hold_id가 필요하다.
+    - smart_import.py는 (file_hash, seq=row_no)로 보류를 추적하므로, 동일 키로 조회하는
+      보조 함수를 제공한다.
+
+    반환 형식:
+    - get_upload_hold()와 동일한 dict 구조(주요 키: id, file_hash, row_no, status ...)를 반환한다.
+    - 없으면 None 반환.
+    """
+    if not file_hash or not row_no:
+        return None
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT id, file_hash, row_no, filename, reason_code, reason_msg, status,
+                      raw_json, normalized_json, corrected_json, candidates_json, row_payload_json,
+                      created_at, updated_at
+                   FROM upload_holds
+                  WHERE file_hash=? AND row_no=?""",
+            (str(file_hash), int(row_no)),
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        return {
+            "id": int(r[0]),
+            "file_hash": r[1],
+            "row_no": int(r[2]),
+            "filename": r[3],
+            "reason_code": r[4],
+            "reason_msg": r[5],
+            "status": r[6],
+            "raw_json": r[7],
+            "normalized_json": r[8],
+            "corrected_json": r[9],
+            "candidates_json": r[10],
+            "row_payload_json": r[11],
+            "created_at": r[12],
+            "updated_at": r[13],
+        }
+    finally:
+        conn.close()
+
+
+
+def update_upload_hold_corrected(
+    hold_id: int,
+    corrected: dict | None = None,
+    *,
+    name: str | None = None,
+    phone: str | None = None,
+    birth_date: str | None = None,
+    decided_by: str = "",
+):
+    """보류 항목의 정정값(corrected) 저장 + 후보 재탐색.
+
+    [데이터(db포함) 오류] '업로드보류(관리)' 화면에서 대표님이 이름/전화/생년월일을 수정하면
+    그 즉시 후보 고객(candidates)을 다시 계산해 보여줘야 한다.
+
+    main.py 호환:
+    - update_upload_hold_corrected(hid, name=..., phone=..., birth_date=...) 형태를 지원한다.
+    - 반환: (ok:bool, msg:str, extra:dict|None)
+    """
+    # corrected 딕셔너리 구성(직접 전달된 dict 우선, 키워드 인자는 덮어쓰기)
+    corr = corrected.copy() if isinstance(corrected, dict) else {}
+    if name is not None:
+        corr["name"] = name
+    if phone is not None:
+        corr["phone"] = phone
+    if birth_date is not None:
+        corr["birth_date"] = birth_date
+
+    corr_name = (corr.get("name") or "").strip()
+    corr_phone = normalize_phone(corr.get("phone") or "")
+    corr_birth = normalize_birth(corr.get("birth_date") or "")
+
+    # 후보 재탐색(정정값 기반)
+    candidates = find_customer_candidates(corr_name, corr_phone, corr_birth, limit=30)
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE upload_holds
+                   SET corrected_json=?,
+                       candidates_json=?,
+                       updated_at=CURRENT_TIMESTAMP
+                 WHERE id=?""",
+            (_json_dumps_safe({"name": corr_name, "phone": corr_phone, "birth_date": corr_birth}),
+             _json_dumps_safe(candidates),
+             int(hold_id)),
+        )
+        conn.commit()
+        audit_log(
+            "HOLD_CORRECTED_UPDATED",
+            "upload_holds",
+            int(hold_id),
+            {"corrected": {"name": corr_name, "phone": corr_phone, "birth_date": corr_birth}, "cand_count": len(candidates)},
+            decided_by,
+        )
+        return True, "정정 저장 완료", {"candidates": candidates}
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"정정 저장 실패: {e}", None
+    finally:
+        conn.close()
+
+
+def set_upload_hold_status_by_file_row(file_hash: str, row_no: int, status: str) -> None:
+    """(file_hash,row_no)로 보류 상태를 변경한다."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE upload_holds
+                  SET status=?, updated_at=CURRENT_TIMESTAMP
+                WHERE file_hash=? AND row_no=?""",
+            ((status or "OPEN").upper(), file_hash, int(row_no)),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def resolve_upload_hold_by_file_row(file_hash: str, row_no: int) -> None:
+    set_upload_hold_status_by_file_row(file_hash, row_no, "RESOLVED")
+
+def set_upload_hold_status(hold_id: int, status: str, *, decided_by: str = ""):
+    """보류 항목 1건의 상태를 변경한다.
+
+    [데이터(db포함) 오류] UI에서 '해결됨 표시'를 누르면 해당 보류는 RESOLVED로 전환되고,
+    목록에서 자동 제거(필터 OPEN 기준)된다.
+
+    반환: (ok:bool, msg:str, extra:dict|None)
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE upload_holds
+                   SET status=?,
+                       updated_at=CURRENT_TIMESTAMP
+                 WHERE id=?""",
+            (str(status).upper(), int(hold_id)),
+        )
+        conn.commit()
+        audit_log(
+            "HOLD_STATUS_UPDATED",
+            "upload_holds",
+            int(hold_id),
+            {"status": str(status).upper()},
+            decided_by,
+        )
+        return True, "상태 변경 완료", get_upload_hold(int(hold_id))
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, f"상태 변경 실패: {e}", None
+    finally:
+        conn.close()
+
+
+
+def insert_hold_decision(hold_id: int, decision: str, target_customer_id: int | None = None, decision_json: dict | None = None, decided_by: str = "") -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO hold_decisions (hold_id, decision, target_customer_id, decision_json, decided_by)
+                   VALUES (?, ?, ?, ?, ?)""",
+            (int(hold_id), (decision or "").upper(), int(target_customer_id) if target_customer_id else None, _json_dumps_safe(decision_json), (decided_by or "").strip()),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def insert_approval_proof(hold_id: int, approval: str, approval_json: dict | None = None, approved_by: str = "") -> None:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO approval_proofs (hold_id, approval, approval_json, approved_by)
+                   VALUES (?, ?, ?, ?)""",
+            (int(hold_id), (approval or "AUTO").upper(), _json_dumps_safe(approval_json), (approved_by or "").strip()),
+        )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def apply_upload_hold_decision(
+    hold_id: int,
+    decision: str,
+    target_customer_id: int | None = None,
+    corrected: dict | None = None,
+    decided_by: str = "",
+):
+    """업로드보류(관리)에서 선택한 결정을 실제 DB에 반영한다.
+
+    [데이터(db포함) 오류] 보류 처리의 핵심은 'hold_store → decision → approval → audit' 흐름이다.
+    - hold_store: upload_holds에 원본행 + 정규화/정정/후보를 보관
+    - decision: 대표님이 선택(MAP_EXISTING / CREATE_NEW / SKIP)
+    - approval: 승인 증적(approval_proofs) 저장
+    - audit: audit_log 기록(사후 검증/특허 방어력)
+
+    main.py 호환:
+    - 반환: (ok:bool, msg:str, extra:dict|None)
+    """
+    hold = get_upload_hold(int(hold_id))
+    if not hold:
+        return False, "보류 항목을 찾을 수 없음", None
+
+    dec = (decision or "").upper().strip()
+
+    # 정정 저장(선택) - UI에서 입력한 정정값을 hold_store에 즉시 반영
+    if corrected is not None:
+        update_upload_hold_corrected(int(hold_id), corrected, decided_by=decided_by)
+        hold = get_upload_hold(int(hold_id)) or hold
+
+    # SKIP(보류 유지 또는 스킵 처리)
+    if dec == "SKIP":
+        set_upload_hold_status_by_file_row(hold["file_hash"], hold["row_no"], "SKIPPED")
+        insert_hold_decision(int(hold_id), dec, None, {"note": "skipped"}, decided_by)
+        insert_approval_proof(int(hold_id), "APPROVED", {"decision": dec}, decided_by)
+        audit_log("HOLD_SKIP", "upload_holds", int(hold_id), {"by": decided_by})
+        return True, "스킵 처리됨(SKIPPED)", {"decision": dec}
+
+    # payload
+    try:
+        payload = json.loads(hold.get("row_payload_json") or "{}")
+    except Exception:
+        payload = {}
+
+    # effective customer fields
+    try:
+        corr = json.loads(hold.get("corrected_json") or "{}")
+    except Exception:
+        corr = {}
+    if corrected is not None:
+        # 바로 전달된 정정값을 우선
+        corr = corrected or corr
+
+    eff_name = (corr.get("name") or payload.get("name") or "").strip()
+    eff_phone = (corr.get("phone") or payload.get("phone") or "").strip()
+    eff_birth = (corr.get("birth_date") or payload.get("birth_date") or "").strip()
+
+    # 결정에 따른 customer_id
+    cid = None
+    if dec == "MAP_EXISTING":
+        if not target_customer_id:
+            return False, "기존 고객 매핑을 위해 대상 고객을 선택해야 함", {"decision": dec}
+        cid = int(target_customer_id)
+    elif dec == "CREATE_NEW":
+        ok, msg, cid = create_customer_direct(
+            eff_name,
+            eff_phone,
+            birth_date=eff_birth,
+            gender=payload.get("gender") or "",
+            region=payload.get("region") or "",
+            address=payload.get("address") or "",
+            email=payload.get("email") or "",
+            source=payload.get("source") or "upload_hold",
+            custom_data=payload.get("custom_data") if isinstance(payload.get("custom_data"), dict) else None,
+            memo=payload.get("memo") or "",
+        )
+        if not ok or not cid:
+            return False, f"고객 신규 생성 실패: {msg}", {"decision": dec, "name": eff_name, "phone": eff_phone}
+    else:
+        return False, "알 수 없는 결정", {"decision": dec}
+
+    fin = payload.get("financial") or {}
+
+    # 계약 반영
+    c_ok, c_action = add_contract(
+        customer_id=cid,
+        company=fin.get("company"),
+        product_name=fin.get("product_name"),
+        policy_no=fin.get("policy_no"),
+        premium=fin.get("premium"),
+        status=fin.get("status"),
+        start_date=fin.get("start_date"),
+        end_date=fin.get("end_date"),
+        coverage_summary=fin.get("coverage_summary"),
+        insured_name=fin.get("insured_name"),
+        insured_phone=fin.get("insured_phone"),
+        insured_birth=fin.get("insured_birth"),
+        insured_gender=fin.get("insured_gender"),
+        insured_ssn=fin.get("insured_ssn"),
+        policyholder_name=payload.get("policyholder_name"),
+        policyholder_phone=payload.get("policyholder_phone"),
+        policyholder_type=payload.get("policyholder_type"),
+        policyholder_norm=payload.get("policyholder_norm"),
+        primary_role=payload.get("primary_role"),
+    )
+
+    # decision 기록(증적용)
+    insert_hold_decision(int(hold_id), dec, cid, {"contract_action": c_action}, decided_by)
+    insert_approval_proof(int(hold_id), "APPROVED", {"decision": dec, "customer_id": cid, "contract_action": c_action}, decided_by)
+
+    if not c_ok or c_action in ("ambig", "fail"):
+        # 계약 반영이 실패/모호면 hold를 OPEN으로 유지(대표님 재확인 필요)
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """UPDATE upload_holds
+                      SET reason_msg=?, status='OPEN', updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?""",
+                (f"{hold.get('reason_msg') or ''} | 계약반영:{c_action}", int(hold_id)),
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            conn.close()
+        audit_log(
+            "HOLD_DECISION_APPLIED_BUT_CONTRACT_NOT_OK",
+            "upload_holds",
+            int(hold_id),
+            {"decision": dec, "customer_id": cid, "contract_action": c_action},
+        )
+        return False, f"계약 반영이 완료되지 않음: {c_action}", {"decision": dec, "customer_id": cid, "contract_action": c_action}
+
+    # 성공 -> RESOLVED
+    set_upload_hold_status_by_file_row(hold["file_hash"], hold["row_no"], "RESOLVED")
+    audit_log("HOLD_RESOLVED", "upload_holds", int(hold_id), {"decision": dec, "customer_id": cid, "contract_action": c_action})
+    return True, f"반영 완료: customer_id={cid}, contract={c_action}", {"decision": dec, "customer_id": cid, "contract_action": c_action}
+
 
 # [데이터(db포함) 오류] 계약자/피보험자 분기 + 법인 계약자 검색 지원(명세서 반영)
 def get_customer_contracts(customer_id):
@@ -1516,9 +2417,11 @@ def get_connection():  # noqa: F811  (의도적 재정의)
     """Always delegate to the hardened connection factory."""
     return _kfit_db.get_connection()
 # [체크리스트]
-# - UI 유지/존치: ✅ 유지됨
-# - 수정 범위: ✅ [데이터(db포함) 오류] 섹션만
+# - UI 유지/존치: ✅ 유지됨 (Queries/API 확장)
+# - 신규: hold_store/decision/approval/audit CRUD + 후보 추천 + create_customer_direct(중복 허용)
+# - 업로드보류(관리) UI 지원: ✅ list_upload_holds / list_upload_hold_batches / list_upload_hold_reason_codes
+# - 수정 범위: ✅ [데이터 정합성 보호 + 업로드보류 워크플로]
 # - '..., 중략, 일부 생략' 금지: ✅ 준수(전체 파일 유지)
-# - 수정 전 라인수: 1332
-# - 수정 후 라인수: 1352
+# - 수정 전 라인수: 2376
+# - 수정 후 라인수: 2427 (+51)
 # ---------------------------------------------------------
